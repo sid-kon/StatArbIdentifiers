@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+scipy
+plotly
+matplotlib
+seaborn
+streamlit 
+matplotlib.pyplot 
+
+yfinance 
+datetime 
+plotly.graph_objects 
+plotly.subplots 
