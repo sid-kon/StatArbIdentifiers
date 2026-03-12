@@ -1,0 +1,592 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+from scipy import stats
+from statsmodels.tsa.stattools import coint
+import yfinance as yf
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+ 
+# ---------------------------------------------------------------------------
+# Universe fetching
+# ---------------------------------------------------------------------------
+ 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_symbols():
+    try:
+        table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        return table['Symbol'].str.replace('.', '-', regex=False).tolist()
+    except Exception:
+        return []
+ 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_nasdaq100_symbols():
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        for t in tables:
+            if 'Ticker' in t.columns:
+                return t['Ticker'].str.replace('.', '-', regex=False).tolist()
+        return []
+    except Exception:
+        return []
+ 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_full_universe():
+    sp500 = get_sp500_symbols()
+    ndx   = get_nasdaq100_symbols()
+    combined = list(dict.fromkeys(sp500 + ndx))
+    return combined if combined else [
+        'AAPL','MSFT','GOOGL','META','AMZN','NVDA','TSLA','JPM',
+        'JNJ','V','PG','UNH','HD','MA','DIS','BAC','XOM','CVX'
+    ]
+ 
+# ---------------------------------------------------------------------------
+# Batched price downloader
+# ---------------------------------------------------------------------------
+ 
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_universe_prices(symbols_tuple, period_days: int):
+    symbols  = list(symbols_tuple)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=period_days)
+    start_str  = start_date.strftime('%Y-%m-%d')
+    end_str    = end_date.strftime('%Y-%m-%d')
+ 
+    BATCH  = 100
+    frames = []
+    batches = [symbols[i:i+BATCH] for i in range(0, len(symbols), BATCH)]
+ 
+    progress = st.progress(0, text="Downloading universe prices…")
+    for idx, batch in enumerate(batches):
+        try:
+            raw = yf.download(
+                batch, start=start_str, end=end_str,
+                auto_adjust=True, progress=False, threads=True
+            )
+            if raw.empty:
+                continue
+            close = raw['Close'].copy() if isinstance(raw.columns, pd.MultiIndex) else raw[['Close']].copy()
+            if not isinstance(raw.columns, pd.MultiIndex):
+                close.columns = batch[:1]
+            close.index = pd.to_datetime(close.index).tz_localize(None)
+            frames.append(close)
+        except Exception:
+            pass
+        progress.progress((idx + 1) / len(batches),
+                          text=f"Downloading… batch {idx+1}/{len(batches)}")
+ 
+    progress.empty()
+    if not frames:
+        return pd.DataFrame()
+ 
+    data = pd.concat(frames, axis=1)
+    data = data.loc[:, ~data.columns.duplicated()]
+    data = data.dropna(how='all', axis=1).dropna(how='all', axis=0)
+    return data
+ 
+# ---------------------------------------------------------------------------
+# Correlation screener
+# ---------------------------------------------------------------------------
+ 
+@st.cache_data(ttl=3600, show_spinner=False)
+def find_top_correlated_pairs(prices_df, top_n_pairs=25):
+    returns = prices_df.pct_change().dropna()
+    cols    = returns.columns.tolist()
+    mat     = np.corrcoef(returns.values.T)
+ 
+    pairs = []
+    n = len(cols)
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = mat[i, j]
+            if not np.isnan(c):
+                pairs.append((cols[i], cols[j], round(float(c), 6)))
+ 
+    pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+    return pd.DataFrame(pairs[:top_n_pairs], columns=['Stock 1', 'Stock 2', 'Correlation'])
+ 
+ 
+def extract_unique_symbols(pairs_df, top_n=20):
+    seen, symbols = set(), []
+    for _, row in pairs_df.iterrows():
+        for s in (row['Stock 1'], row['Stock 2']):
+            if s not in seen:
+                seen.add(s)
+                symbols.append(s)
+        if len(symbols) >= top_n:
+            break
+    return symbols[:top_n]
+ 
+# ---------------------------------------------------------------------------
+# MarketAnalyzer
+# ---------------------------------------------------------------------------
+ 
+class MarketAnalyzer:
+    def __init__(self):
+        self.sectors = {
+            'Technology': ['AAPL', 'MSFT', 'GOOGL', 'META', 'NVDA', 'AMD', 'INTC', 'CRM'],
+            'Finance':    ['JPM', 'BAC', 'GS', 'MS', 'WFC', 'C', 'BLK'],
+            'Healthcare': ['JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'TMO', 'ABT'],
+            'Consumer':   ['AMZN', 'WMT', 'PG', 'KO', 'PEP', 'COST', 'NKE'],
+            'Energy':     ['XOM', 'CVX', 'COP', 'SLB', 'EOG'],
+        }
+        self.stock_info = {}
+ 
+    def fetch_market_data(self, period='1mo'):
+        all_symbols = [s for syms in self.sectors.values() for s in syms]
+        period_to_days = {'1mo': 30, '3mo': 90, '6mo': 180, '1y': 365}
+        days = period_to_days.get(period, 30)
+        end_date   = datetime.now()
+        start_date = end_date - timedelta(days=days)
+ 
+        with st.spinner('Fetching sector data…'):
+            try:
+                raw = yf.download(
+                    all_symbols,
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    auto_adjust=True, progress=False
+                )
+                data = raw['Close'].copy() if isinstance(raw.columns, pd.MultiIndex) else raw[['Close']].copy()
+                data.index = pd.to_datetime(data.index).tz_localize(None)
+                data = data.dropna(how='all')
+            except Exception as e:
+                st.error(f"Error fetching market data: {e}")
+                return pd.DataFrame()
+ 
+            for symbol in all_symbols:
+                if symbol not in self.stock_info:
+                    try:
+                        info = yf.Ticker(symbol).info
+                        self.stock_info[symbol] = {
+                            'sector':     info.get('sector', 'N/A'),
+                            'market_cap': info.get('marketCap', 0),
+                            'pe_ratio':   info.get('trailingPE', 0),
+                            'volume':     info.get('averageVolume', 0),
+                            'beta':       info.get('beta', 0)
+                        }
+                    except Exception:
+                        self.stock_info[symbol] = {
+                            'sector': 'N/A', 'market_cap': 0,
+                            'pe_ratio': 0, 'volume': 0, 'beta': 0
+                        }
+ 
+        return data if not data.empty else pd.DataFrame()
+ 
+    def calculate_market_metrics(self, data):
+        returns = data.pct_change().dropna()
+        metrics = pd.DataFrame(index=data.columns)
+        metrics['Daily Returns Mean'] = returns.mean() * 100
+        metrics['Daily Returns Std']  = returns.std() * 100
+        first_stock = returns.columns[0]
+        betas = []
+        for col in returns.columns:
+            try:
+                betas.append(stats.linregress(returns[first_stock], returns[col])[0])
+            except Exception:
+                betas.append(np.nan)
+        metrics['Beta']           = betas
+        metrics['Volume']         = [self.stock_info.get(s, {}).get('volume', 0) for s in data.columns]
+        metrics['Market Cap (B)'] = [(self.stock_info.get(s, {}).get('market_cap', 0) or 0) / 1e9 for s in data.columns]
+        metrics['P/E Ratio']      = [self.stock_info.get(s, {}).get('pe_ratio', 0) or 0 for s in data.columns]
+        return metrics
+ 
+    def plot_correlation_matrix(self, data, sector=None):
+        if sector and sector != 'All':
+            syms = [s for s in self.sectors[sector] if s in data.columns]
+            corr_data = data[syms].corr()
+        else:
+            corr_data = data.corr()
+        fig = px.imshow(
+            corr_data,
+            labels=dict(x="Stock", y="Stock", color="Correlation"),
+            color_continuous_scale="RdBu", aspect="auto"
+        )
+        fig.update_layout(
+            title=f"Correlation Matrix – {sector if sector != 'All' else 'All Stocks'}",
+            width=800, height=800
+        )
+        return fig
+ 
+# ---------------------------------------------------------------------------
+# StatArbAnalyzer
+# ---------------------------------------------------------------------------
+ 
+class StatArbAnalyzer:
+    def __init__(self, lookback_period='1y', confidence_level=0.05):
+        self.lookback_period  = lookback_period
+        self.confidence_level = confidence_level
+ 
+    def fetch_data(self, symbols):
+        period_to_days = {'1mo': 30, '3mo': 90, '6mo': 180, '1y': 365, '2y': 730}
+        days       = period_to_days.get(self.lookback_period, 365)
+        end_date   = datetime.now()
+        start_date = end_date - timedelta(days=days)
+ 
+        with st.spinner('Fetching pair data…'):
+            try:
+                raw = yf.download(
+                    symbols,
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    auto_adjust=True, progress=False
+                )
+                if isinstance(raw.columns, pd.MultiIndex):
+                    data = raw['Close'].copy()
+                else:
+                    data = raw[['Close']].copy()
+                    data.columns = symbols[:1]
+                data.index = pd.to_datetime(data.index).tz_localize(None)
+                data = data.dropna(axis=1, how='all').dropna(axis=0, how='any')
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+                return pd.DataFrame()
+ 
+        if data.empty:
+            st.error("No valid data returned.")
+        return data
+ 
+    def calculate_pairs_metrics(self, data):
+        n = len(data.columns)
+        rows = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                s1, s2 = data.columns[i], data.columns[j]
+                correlation = data[s1].corr(data[s2])
+                try:
+                    _, pvalue, _ = coint(data[s1], data[s2])
+                except Exception:
+                    pvalue = 1.0
+ 
+                # Use log prices for a stationary, drift-resistant hedge ratio
+                log_s1 = np.log(data[s1].values)
+                log_s2 = np.log(data[s2].values)
+                X = np.column_stack([log_s2, np.ones(len(data))])
+                beta, _, _, _ = np.linalg.lstsq(X, log_s1, rcond=None)
+                hedge_ratio    = beta[0]
+                spread         = pd.Series(log_s1 - hedge_ratio * log_s2, index=data.index)
+                spread_mean    = spread.mean()
+                spread_std     = spread.std(ddof=1)
+                current_spread = spread.iloc[-1]
+                z_score = (current_spread - spread_mean) / spread_std if spread_std > 0 else 0.0
+ 
+                # Half-life via explicit OLS with intercept (handles non-zero mean spreads)
+                spread_lag  = spread.shift(1).iloc[1:]
+                spread_diff = (spread - spread.shift(1)).iloc[1:]
+                try:
+                    X_hl = np.column_stack([spread_lag.values, np.ones(len(spread_lag))])
+                    reg_hl, _, _, _ = np.linalg.lstsq(X_hl, spread_diff.values, rcond=None)
+                    half_life = -np.log(2) / reg_hl[0] if reg_hl[0] < 0 else np.inf
+                except Exception:
+                    half_life = np.inf
+ 
+                rows.append({
+                    'stock1': s1, 'stock2': s2,
+                    'correlation': correlation,
+                    'cointegration_pvalue': pvalue,
+                    'hedge_ratio': hedge_ratio,
+                    'current_spread': current_spread,
+                    'spread_mean': spread_mean,
+                    'spread_std': spread_std,
+                    'z_score': z_score,
+                    'half_life': half_life
+                })
+        return pd.DataFrame(rows)
+ 
+    def plot_pair_analysis(self, data, stock1, stock2):
+        normalized = pd.DataFrame({
+            stock1: data[stock1] / data[stock1].iloc[0] * 100,
+            stock2: data[stock2] / data[stock2].iloc[0] * 100
+        })
+        # Log prices for hedge ratio (consistent with calculate_pairs_metrics)
+        log_s1 = np.log(data[stock1].values)
+        log_s2 = np.log(data[stock2].values)
+        X = np.column_stack([log_s2, np.ones(len(data))])
+        beta, _, _, _ = np.linalg.lstsq(X, log_s1, rcond=None)
+        spread      = pd.Series(log_s1 - beta[0] * log_s2, index=data.index)
+        spread_mean = spread.mean()
+        spread_std  = spread.std(ddof=1)
+        z_scores    = (spread - spread_mean) / spread_std if spread_std > 0 else spread * 0
+ 
+        fig = make_subplots(rows=2, cols=1,
+                            subplot_titles=('Normalized Prices (base 100)', 'Z-Score of Spread'))
+        fig.add_trace(go.Scatter(x=normalized.index, y=normalized[stock1],
+                                 name=stock1, line=dict(color='blue')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=normalized.index, y=normalized[stock2],
+                                 name=stock2, line=dict(color='red')),  row=1, col=1)
+        fig.add_trace(go.Scatter(x=z_scores.index, y=z_scores,
+                                 name='Z-Score', line=dict(color='green')), row=2, col=1)
+        fig.add_hline(y=2,  line_dash="dash", line_color="red",  row=2, col=1)
+        fig.add_hline(y=-2, line_dash="dash", line_color="red",  row=2, col=1)
+        fig.add_hline(y=0,  line_dash="dash", line_color="gray", row=2, col=1)
+        fig.update_layout(height=800, title_text="Pair Analysis")
+        return fig
+ 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+ 
+def main():
+    st.set_page_config(page_title="Market Analysis & Statistical Arbitrage", layout="wide")
+ 
+    market_analyzer   = MarketAnalyzer()
+    stat_arb_analyzer = StatArbAnalyzer()
+ 
+    tab1, tab2, tab3 = st.tabs(["Market Overview", "Universe Screener", "Statistical Arbitrage"])
+ 
+    # ------------------------------------------------------------------
+    # TAB 1 – Market Overview
+    # ------------------------------------------------------------------
+    with tab1:
+        st.title("Market Overview")
+        st.sidebar.header("Market Analysis Parameters")
+        selected_period = st.sidebar.selectbox(
+            "Analysis Period", options=['1mo', '3mo', '6mo', '1y'], index=0
+        )
+        selected_sector = st.sidebar.selectbox(
+            "Sector for Correlation Matrix",
+            options=['All'] + list(market_analyzer.sectors.keys())
+        )
+ 
+        market_data = market_analyzer.fetch_market_data(period=selected_period)
+ 
+        st.header("Market Metrics")
+        sector_tabs = st.tabs(list(market_analyzer.sectors.keys()))
+        for sector, sector_tab in zip(market_analyzer.sectors.keys(), sector_tabs):
+            with sector_tab:
+                sector_symbols = [s for s in market_analyzer.sectors[sector] if s in market_data.columns]
+                sector_data    = market_data[sector_symbols]
+                if sector_data.empty:
+                    st.warning(f"No data available for {sector}")
+                    continue
+                try:
+                    sector_metrics = market_analyzer.calculate_market_metrics(sector_data)
+                    st.subheader(f"{sector} Sector Metrics")
+                    st.dataframe(sector_metrics.style.format({
+                        'Daily Returns Mean': '{:.2f}%',
+                        'Daily Returns Std':  '{:.2f}%',
+                        'Beta':               '{:.2f}',
+                        'Volume':             '{:,.0f}',
+                        'Market Cap (B)':     '{:.2f}',
+                        'P/E Ratio':          '{:.2f}'
+                    }))
+                    st.subheader("Price Performance")
+                    normalized = sector_data.div(sector_data.iloc[0]).mul(100)
+                    fig = px.line(normalized, title=f"{sector} – Normalized Prices")
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error processing {sector}: {e}")
+ 
+        st.header("Correlation Analysis")
+        st.plotly_chart(market_analyzer.plot_correlation_matrix(market_data, selected_sector))
+ 
+        st.subheader("Highest Correlated Pairs (Sector Universe)")
+        corr_matrix = market_data.corr()
+        pairs = []
+        for i in range(len(corr_matrix.columns)):
+            for j in range(i + 1, len(corr_matrix.columns)):
+                pairs.append({
+                    'Stock 1':     corr_matrix.columns[i],
+                    'Stock 2':     corr_matrix.columns[j],
+                    'Correlation': corr_matrix.iloc[i, j]
+                })
+        pairs_df = pd.DataFrame(pairs).sort_values('Correlation', ascending=False)
+        st.dataframe(pairs_df.head(10).style.format({'Correlation': '{:.3f}'}))
+ 
+    # ------------------------------------------------------------------
+    # TAB 2 – Universe Screener
+    # ------------------------------------------------------------------
+    with tab2:
+        st.title("Universe Correlation Screener")
+        st.markdown(
+            "Scans the full **S&P 500 + NASDAQ-100** (~550 stocks) to find the most "
+            "correlated pairs. **Check the pairs you want**, then send them to the "
+            "Statistical Arbitrage tab."
+        )
+ 
+        col_a, col_b = st.columns(2)
+        with col_a:
+            screen_period = st.selectbox(
+                "Screening Period", ['1mo', '3mo', '6mo', '1y'], index=1, key='screen_period'
+            )
+        with col_b:
+            top_n_pairs = st.number_input(
+                "Top N pairs to show", min_value=10, max_value=100, value=30, step=5
+            )
+ 
+        if st.button("🔍  Scan Universe for Top Correlated Pairs", type="primary"):
+            period_to_days = {'1mo': 30, '3mo': 90, '6mo': 180, '1y': 365}
+            days = period_to_days[screen_period]
+ 
+            with st.spinner("Loading S&P 500 + NASDAQ-100 symbols…"):
+                universe = get_full_universe()
+            st.info(f"Universe: **{len(universe)} symbols**")
+ 
+            prices = download_universe_prices(tuple(universe), days)
+ 
+            if prices.empty:
+                st.error("Failed to download universe prices.")
+            else:
+                st.success(f"Downloaded prices for **{len(prices.columns)} symbols** ({screen_period}).")
+ 
+                with st.spinner("Computing pairwise correlations…"):
+                    top_pairs_df = find_top_correlated_pairs(prices, top_n_pairs=int(top_n_pairs))
+ 
+                # Store results in session state so the table persists across reruns
+                st.session_state['top_pairs_df'] = top_pairs_df
+ 
+        # Show the interactive selection table whenever results exist
+        if 'top_pairs_df' in st.session_state:
+            top_pairs_df = st.session_state['top_pairs_df']
+ 
+            st.subheader(f"Top {len(top_pairs_df)} Most Correlated Pairs")
+            st.markdown("✅ **Check the pairs you want to analyse**, then click **Send to Stat Arb**.")
+ 
+            # Add a Select column for checkboxes
+            selectable = top_pairs_df.copy()
+            selectable.insert(0, 'Select', False)
+ 
+            edited = st.data_editor(
+                selectable,
+                column_config={
+                    'Select':      st.column_config.CheckboxColumn('Select', default=False),
+                    'Stock 1':     st.column_config.TextColumn('Stock 1',     disabled=True),
+                    'Stock 2':     st.column_config.TextColumn('Stock 2',     disabled=True),
+                    'Correlation': st.column_config.NumberColumn('Correlation', format='%.4f', disabled=True),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+ 
+            selected_pairs = edited[edited['Select'] == True]
+            n_selected = len(selected_pairs)
+ 
+            # Preview which unique symbols will be sent
+            if n_selected > 0:
+                preview_symbols = []
+                seen = set()
+                for _, row in selected_pairs.iterrows():
+                    for s in (row['Stock 1'], row['Stock 2']):
+                        if s not in seen:
+                            seen.add(s)
+                            preview_symbols.append(s)
+                st.info(
+                    f"**{n_selected} pair(s) selected → {len(preview_symbols)} unique symbols:** "
+                    f"`{', '.join(preview_symbols)}`"
+                )
+ 
+            col_send, col_clear = st.columns([2, 1])
+            with col_send:
+                send_disabled = n_selected == 0
+                if st.button(
+                    f"➡️  Send {n_selected} selected pair(s) to Statistical Arbitrage",
+                    type="primary",
+                    disabled=send_disabled
+                ):
+                    symbols_to_send = []
+                    seen = set()
+                    for _, row in selected_pairs.iterrows():
+                        for s in (row['Stock 1'], row['Stock 2']):
+                            if s not in seen:
+                                seen.add(s)
+                                symbols_to_send.append(s)
+                    st.session_state['preloaded_symbols'] = ",".join(symbols_to_send)
+                    st.success(
+                        f"✅ **{len(symbols_to_send)} symbols sent** to the Statistical Arbitrage tab: "
+                        f"`{', '.join(symbols_to_send)}`"
+                    )
+                    st.info("Switch to the **Statistical Arbitrage** tab and click **Run Analysis**.")
+            with col_clear:
+                if st.button("🗑️  Clear selection & results"):
+                    for key in ('top_pairs_df', 'preloaded_symbols'):
+                        st.session_state.pop(key, None)
+                    st.rerun()
+ 
+    # ------------------------------------------------------------------
+    # TAB 3 – Statistical Arbitrage
+    # ------------------------------------------------------------------
+    with tab3:
+        st.title("Statistical Arbitrage Analysis")
+        st.sidebar.header("Statistical Arbitrage Parameters")
+ 
+        if 'preloaded_symbols' in st.session_state and st.session_state['preloaded_symbols']:
+            default_symbols = st.session_state['preloaded_symbols']
+            st.sidebar.success("📊 Symbols preloaded from Universe Screener.")
+        else:
+            default_symbols = "AAPL,MSFT,GOOGL,META,AMZN,NFLX"
+            st.sidebar.info("💡 Run the **Universe Screener** tab to auto-populate the most correlated stocks.")
+ 
+        symbols_input = st.sidebar.text_area("Stock symbols (comma-separated)", value=default_symbols)
+        symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
+ 
+        lookback_period = st.sidebar.selectbox(
+            "Lookback Period", options=['1mo', '3mo', '6mo', '1y', '2y'], index=3
+        )
+        z_score_threshold = st.sidebar.slider(
+            "Z-Score Threshold", min_value=1.0, max_value=3.0, value=2.0, step=0.1
+        )
+        min_correlation = st.sidebar.slider(
+            "Minimum Correlation", min_value=0.0, max_value=1.0, value=0.7, step=0.05
+        )
+ 
+        if st.sidebar.button("Run Analysis", type="primary"):
+            stat_arb_analyzer.lookback_period = lookback_period
+            data = stat_arb_analyzer.fetch_data(symbols)
+ 
+            if data.empty or len(data.columns) < 2:
+                st.error("Please enter at least 2 valid stock symbols.")
+                return
+ 
+            with st.spinner("Analysing pairs…"):
+                pairs_metrics = stat_arb_analyzer.calculate_pairs_metrics(data)
+ 
+            opportunities = pairs_metrics[
+                (pairs_metrics['correlation'].abs() >= min_correlation) &
+                (pairs_metrics['cointegration_pvalue'] <= stat_arb_analyzer.confidence_level) &
+                (pairs_metrics['z_score'].abs() >= z_score_threshold)
+            ]
+ 
+            st.header("Analysis Results")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Pairs Analysed", len(pairs_metrics))
+            c2.metric("Opportunities Found",  len(opportunities))
+            c3.metric("Average Correlation",  f"{pairs_metrics['correlation'].mean():.3f}")
+ 
+            if len(opportunities) > 0:
+                st.subheader("Trading Opportunities")
+                for _, opp in opportunities.iterrows():
+                    with st.expander(
+                        f"{opp['stock1']} – {opp['stock2']}  (Z-Score: {opp['z_score']:.2f})"
+                    ):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write("**Metrics:**")
+                            st.write(f"Correlation: {opp['correlation']:.3f}")
+                            st.write(f"Cointegration p-value: {opp['cointegration_pvalue']:.3f}")
+                            st.write(f"Half-life: {opp['half_life']:.1f} days")
+                            st.write(f"Hedge Ratio: {opp['hedge_ratio']:.4f}")
+                        with col2:
+                            st.write("**Trading Signal:**")
+                            if opp['z_score'] > 0:
+                                st.write(f"Short {opp['stock1']} / Long {opp['hedge_ratio']:.4f}× {opp['stock2']}")
+                            else:
+                                st.write(f"Long {opp['stock1']} / Short {opp['hedge_ratio']:.4f}× {opp['stock2']}")
+                            st.write(f"Spread deviates **{abs(opp['z_score']):.2f} σ** from mean")
+                            st.write("**Current Spread:**")
+                            st.write(
+                                f"Value: {opp['current_spread']:.2f}  |  "
+                                f"Mean: {opp['spread_mean']:.2f}  |  "
+                                f"Std: {opp['spread_std']:.2f}"
+                            )
+                        fig = stat_arb_analyzer.plot_pair_analysis(data, opp['stock1'], opp['stock2'])
+                        st.plotly_chart(fig, use_container_width=True)
+ 
+                with st.expander("View All Pairs Metrics"):
+                    st.dataframe(pairs_metrics.sort_values('correlation', ascending=False))
+            else:
+                st.info("No trading opportunities found. Try lowering the Z-Score or Correlation thresholds.")
+ 
+if __name__ == '__main__':
+    main()
