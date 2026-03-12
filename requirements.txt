@@ -1,10 +1,8 @@
 streamlit 
 numpy 
 pandas 
-scipy import stats
-statsmodels.tsa.stattools import coint
+scipy 
+statsmodels
 yfinance 
-datetime import datetime, timedelta
-plotly.graph_objects as go
-plotly.express 
-plotly.subplots import make_subplots
+datetime 
+plotly
