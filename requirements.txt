@@ -1,14 +1,10 @@
-streamlit
-pandas
-numpy
-scipy
-plotly
-matplotlib
-seaborn
 streamlit 
-matplotlib.pyplot 
-
+numpy 
+pandas 
+scipy import stats
+statsmodels.tsa.stattools import coint
 yfinance 
-datetime 
-plotly.graph_objects 
-plotly.subplots 
+datetime import datetime, timedelta
+plotly.graph_objects as go
+plotly.express 
+plotly.subplots import make_subplots
